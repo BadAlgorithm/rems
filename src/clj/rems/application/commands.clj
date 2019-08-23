@@ -179,31 +179,38 @@
   (is (= (set (keys command-schemas))
          (set (keys (methods command-handler))))))
 
-(defn- must-not-be-empty [cmd key]
+(defn- check-must-not-be-empty [cmd key]
   (when-not (seq (get cmd key))
-    {:errors [{:type :must-not-be-empty :key key}]}))
+    (throw (ex-info "Validation error"
+                    {:errors [{:type :must-not-be-empty :key key}]}))))
 
 (defn- invalid-user-error [user-id {:keys [valid-user?]}]
   (cond
-    (not valid-user?) {:errors [{:type :missing-injection :injection :valid-user?}]}
-    (not (valid-user? user-id)) {:errors [{:type :t.form.validation/invalid-user :userid user-id}]}))
+    (not valid-user?) {:errors [{:type :missing-injection
+                                 :injection :valid-user?}]}
+    (not (valid-user? user-id)) {:errors [{:type :t.form.validation/invalid-user
+                                           :userid user-id}]}))
 
-(defn- invalid-users-errors
+(defn- check-invalid-users
   "Checks the given users for validity and merges the errors"
   [user-ids injections]
-  (apply merge-with into (keep #(invalid-user-error % injections) user-ids)))
+  (when-let [error (apply merge-with into (keep #(invalid-user-error % injections) user-ids))]
+    (throw (ex-info "Validation error" error))))
 
 (defn- invalid-catalogue-item-error [catalogue-item-id {:keys [get-catalogue-item]}]
   (cond
-    (not get-catalogue-item) {:errors [{:type :missing-injection :injection :get-catalogue-item}]}
-    (not (get-catalogue-item catalogue-item-id)) {:errors [{:type :invalid-catalogue-item :catalogue-item-id catalogue-item-id}]}))
+    (not get-catalogue-item) {:errors [{:type :missing-injection
+                                        :injection :get-catalogue-item}]}
+    (not (get-catalogue-item catalogue-item-id)) {:errors [{:type :invalid-catalogue-item
+                                                            :catalogue-item-id catalogue-item-id}]}))
 
-(defn- invalid-catalogue-items
+(defn- check-invalid-catalogue-items
   "Checks the given catalogue items for validity and merges the errors"
   [catalogue-item-ids injections]
-  (apply merge-with into (keep #(invalid-catalogue-item-error % injections) catalogue-item-ids)))
+  (when-let [error (apply merge-with into (keep #(invalid-catalogue-item-error % injections) catalogue-item-ids))]
+    (throw (ex-info "Validation error" error))))
 
-(defn- changes-original-workflow
+(defn- check-changes-original-workflow
   "Checks that the given catalogue items are compatible with the original application from where the workflow is from. Applicant can't do it."
   [application catalogue-item-ids actor {:keys [get-catalogue-item]}]
   (let [catalogue-items (map get-catalogue-item catalogue-item-ids)
@@ -212,9 +219,12 @@
         handlers (get-in application [:application/workflow :workflow.dynamic/handlers])]
     (when (and (not (contains? handlers actor))
                (apply not= original-workflow-id new-workflow-ids))
-      {:errors [{:type :changes-original-workflow :workflow/id original-workflow-id :ids new-workflow-ids}]})))
+      (throw (ex-info "Validation error"
+                      {:errors [{:type :changes-original-workflow
+                                 :workflow/id original-workflow-id
+                                 :ids new-workflow-ids}]})))))
 
-(defn- changes-original-form
+(defn- check-changes-original-form
   "Checks that the given catalogue items are compatible with the original application from where the form is from. Applicant can't do it."
   [application catalogue-item-ids actor {:keys [get-catalogue-item]}]
   (let [catalogue-items (map get-catalogue-item catalogue-item-ids)
@@ -223,23 +233,28 @@
         handlers (get-in application [:application/workflow :workflow.dynamic/handlers])]
     (when (and (not (contains? handlers actor))
                (apply not= original-form-id new-form-ids))
-      {:errors [{:type :changes-original-form :form/id original-form-id :ids new-form-ids}]})))
+      (throw (ex-info "Validation error"
+                      {:errors [{:type :changes-original-form
+                                 :form/id original-form-id
+                                 :ids new-form-ids}]})))))
 
-(defn- unbundlable-catalogue-items
+(defn- check-unbundlable-catalogue-items
   "Checks that the given catalogue items are bundlable."
   [catalogue-item-ids {:keys [get-catalogue-item]}]
   (let [catalogue-items (map get-catalogue-item catalogue-item-ids)]
     (when (not= 1
                 (count (set (map :formid catalogue-items)))
                 (count (set (map :wfid catalogue-items))))
-      {:errors [{:type :unbundlable-catalogue-items :catalogue-item-ids catalogue-item-ids}]})))
+      (throw (ex-info "Validation error"
+                      {:errors [{:type :unbundlable-catalogue-items
+                                 :catalogue-item-ids catalogue-item-ids}]})))))
 
-(defn- unbundlable-catalogue-items-for-actor
+(defn- check-unbundlable-catalogue-items-for-actor
   "Checks that the given catalogue items are bundlable by the given actor."
   [application catalogue-item-ids actor injections]
   (let [handlers (get-in application [:application/workflow :workflow.dynamic/handlers])]
     (when-not (contains? handlers actor)
-      (unbundlable-catalogue-items catalogue-item-ids injections))))
+      (check-unbundlable-catalogue-items catalogue-item-ids injections))))
 
 (defn- validation-error [application {:keys [validate-fields]}]
   (let [errors (validate-fields (getx-in application [:application/form :form/fields]))]
@@ -284,25 +299,25 @@
 (defn- application-created-event! [{:keys [catalogue-item-ids time actor] :as cmd}
                                    {:keys [allocate-application-ids! get-catalogue-item get-workflow]
                                     :as injections}]
-  (or (must-not-be-empty cmd :catalogue-item-ids)
-      (invalid-catalogue-items catalogue-item-ids injections)
-      (unbundlable-catalogue-items catalogue-item-ids injections)
-      (let [items (map get-catalogue-item catalogue-item-ids)
-            form-id (:formid (first items))
-            workflow-id (:wfid (first items))
-            workflow-type (:type (:workflow (get-workflow workflow-id)))
-            _ (assert (= :workflow/dynamic workflow-type) {:workflow-type workflow-type}) ; TODO: support other workflows
-            ids (allocate-application-ids! time)]
-        {:event {:event/type :application.event/created
-                 :event/time time
-                 :event/actor actor
-                 :application/id (:application/id ids)
-                 :application/external-id (:application/external-id ids)
-                 :application/resources (build-resources-list catalogue-item-ids injections)
-                 :application/licenses (build-licenses-list catalogue-item-ids injections)
-                 :form/id form-id
-                 :workflow/id workflow-id
-                 :workflow/type workflow-type}})))
+  (check-must-not-be-empty cmd :catalogue-item-ids)
+  (check-invalid-catalogue-items catalogue-item-ids injections)
+  (check-unbundlable-catalogue-items catalogue-item-ids injections)
+  (let [items (map get-catalogue-item catalogue-item-ids)
+        form-id (:formid (first items))
+        workflow-id (:wfid (first items))
+        workflow-type (:type (:workflow (get-workflow workflow-id)))
+        _ (assert (= :workflow/dynamic workflow-type) {:workflow-type workflow-type}) ; TODO: support other workflows
+        ids (allocate-application-ids! time)]
+    {:event/type :application.event/created
+     :event/time time
+     :event/actor actor
+     :application/id (:application/id ids)
+     :application/external-id (:application/external-id ids)
+     :application/resources (build-resources-list catalogue-item-ids injections)
+     :application/licenses (build-licenses-list catalogue-item-ids injections)
+     :form/id form-id
+     :workflow/id workflow-id
+     :workflow/type workflow-type}))
 
 (defmethod command-handler :application.command/create
   [cmd application injections]
@@ -310,12 +325,9 @@
   ;;      so we need to guard against that to avoid the mutative operation of allocating
   ;;      new application IDs when the application already exists.
   (when (nil? application)
-    (let [created-event-or-errors (application-created-event! cmd injections)]
-      (if (:errors created-event-or-errors)
-        created-event-or-errors
-        (let [event (:event created-event-or-errors)]
-          (ok-with-data {:application-id (:application/id event)}
-                        [event]))))))
+    (let [event (application-created-event! cmd injections)]
+      (ok-with-data {:application-id (:application/id event)}
+                    [event]))))
 
 (defmethod command-handler :application.command/save-draft
   [cmd _application _injections]
@@ -356,12 +368,12 @@
 
 (defmethod command-handler :application.command/request-decision
   [cmd _application injections]
-  (or (must-not-be-empty cmd :deciders)
-      (invalid-users-errors (:deciders cmd) injections)
-      (ok {:event/type :application.event/decision-requested
-           :application/request-id (UUID/randomUUID)
-           :application/deciders (:deciders cmd)
-           :application/comment (:comment cmd)})))
+  (check-must-not-be-empty cmd :deciders)
+  (check-invalid-users (:deciders cmd) injections)
+  (ok {:event/type :application.event/decision-requested
+       :application/request-id (UUID/randomUUID)
+       :application/deciders (:deciders cmd)
+       :application/comment (:comment cmd)}))
 
 (defn- actor-is-not-decider-error [application cmd]
   (when-not (contains? (get application ::model/latest-decision-request-by-user)
@@ -381,12 +393,12 @@
 
 (defmethod command-handler :application.command/request-comment
   [cmd _application injections]
-  (or (must-not-be-empty cmd :commenters)
-      (invalid-users-errors (:commenters cmd) injections)
-      (ok {:event/type :application.event/comment-requested
-           :application/request-id (UUID/randomUUID)
-           :application/commenters (:commenters cmd)
-           :application/comment (:comment cmd)})))
+  (check-must-not-be-empty cmd :commenters)
+  (check-invalid-users (:commenters cmd) injections)
+  (ok {:event/type :application.event/comment-requested
+       :application/request-id (UUID/randomUUID)
+       :application/commenters (:commenters cmd)
+       :application/comment (:comment cmd)}))
 
 (defn- actor-is-not-commenter-error [application cmd]
   (when-not (contains? (get application ::model/latest-comment-request-by-user)
@@ -411,24 +423,24 @@
        :application/public (:public cmd)}))
 
 (defmethod command-handler :application.command/add-licenses
-  [cmd _application injections]
-  (or (must-not-be-empty cmd :licenses)
-      (ok {:event/type :application.event/licenses-added
-           :application/licenses (mapv (fn [id] {:license/id id}) (:licenses cmd))
-           :application/comment (:comment cmd)})))
+  [cmd _application _injections]
+  (check-must-not-be-empty cmd :licenses)
+  (ok {:event/type :application.event/licenses-added
+       :application/licenses (mapv (fn [id] {:license/id id}) (:licenses cmd))
+       :application/comment (:comment cmd)}))
 
 (defmethod command-handler :application.command/change-resources
   [cmd application injections]
-  (or (must-not-be-empty cmd :catalogue-item-ids)
-      (invalid-catalogue-items (:catalogue-item-ids cmd) injections)
-      (unbundlable-catalogue-items-for-actor application (:catalogue-item-ids cmd) (:actor cmd) injections)
-      (changes-original-form application (:catalogue-item-ids cmd) (:actor cmd) injections)
-      (changes-original-workflow application (:catalogue-item-ids cmd) (:actor cmd) injections)
-      (ok (merge {:event/type :application.event/resources-changed
-                  :application/resources (build-resources-list (:catalogue-item-ids cmd) injections)
-                  :application/licenses (build-licenses-list (:catalogue-item-ids cmd) injections)}
-                 (when (:comment cmd)
-                   {:application/comment (:comment cmd)})))))
+  (check-must-not-be-empty cmd :catalogue-item-ids)
+  (check-invalid-catalogue-items (:catalogue-item-ids cmd) injections)
+  (check-unbundlable-catalogue-items-for-actor application (:catalogue-item-ids cmd) (:actor cmd) injections)
+  (check-changes-original-form application (:catalogue-item-ids cmd) (:actor cmd) injections)
+  (check-changes-original-workflow application (:catalogue-item-ids cmd) (:actor cmd) injections)
+  (ok (merge {:event/type :application.event/resources-changed
+              :application/resources (build-resources-list (:catalogue-item-ids cmd) injections)
+              :application/licenses (build-licenses-list (:catalogue-item-ids cmd) injections)}
+             (when (:comment cmd)
+               {:application/comment (:comment cmd)}))))
 
 (defmethod command-handler :application.command/add-member
   [cmd application injections]
@@ -476,30 +488,27 @@
 (defmethod command-handler :application.command/copy-as-new
   [cmd application injections]
   (let [catalogue-item-ids (map :catalogue-item/id (:application/resources application))
-        created-event-or-errors (application-created-event! {:catalogue-item-ids catalogue-item-ids
-                                                             :time (:time cmd)
-                                                             :actor (:actor cmd)}
-                                                            injections)]
-    (if (:errors created-event-or-errors)
-      created-event-or-errors
-      (let [created-event (:event created-event-or-errors)
-            old-app-id (:application/id application)
-            new-app-id (:application/id created-event)]
-        (ok-with-data
-         {:application-id new-app-id}
-         [created-event
-          {:event/type :application.event/draft-saved
-           :application/id new-app-id
-           :application/field-values (->> (:form/fields (:application/form application))
-                                          (map (fn [field]
-                                                 [(:field/id field) (:field/value field)]))
-                                          (into {}))}
-          {:event/type :application.event/copied-from
-           :application/id new-app-id
-           :application/copied-from (select-keys application [:application/id :application/external-id])}
-          {:event/type :application.event/copied-to
-           :application/id old-app-id
-           :application/copied-to (select-keys created-event [:application/id :application/external-id])}])))))
+        created-event (application-created-event! {:catalogue-item-ids catalogue-item-ids
+                                                   :time (:time cmd)
+                                                   :actor (:actor cmd)}
+                                                  injections)
+        old-app-id (:application/id application)
+        new-app-id (:application/id created-event)]
+    (ok-with-data
+     {:application-id new-app-id}
+     [created-event
+      {:event/type :application.event/draft-saved
+       :application/id new-app-id
+       :application/field-values (->> (:form/fields (:application/form application))
+                                      (map (fn [field]
+                                             [(:field/id field) (:field/value field)]))
+                                      (into {}))}
+      {:event/type :application.event/copied-from
+       :application/id new-app-id
+       :application/copied-from (select-keys application [:application/id :application/external-id])}
+      {:event/type :application.event/copied-to
+       :application/id old-app-id
+       :application/copied-to (select-keys created-event [:application/id :application/external-id])}])))
 
 (defn- add-common-event-fields-from-command [event cmd]
   (-> event
@@ -522,12 +531,17 @@
   (let [permissions (if application
                       (permissions/user-permissions application (:actor cmd))
                       #{:application.command/create})]
-    (if (contains? permissions (:type cmd))
-      (-> (command-handler cmd application injections)
-          (enrich-result cmd)
-          (postprocess-command-result-for-tests cmd application))
-      {:errors (or (:errors (command-handler cmd application injections)) ; prefer more specific error
-                   [{:type :forbidden}])})))
+    (try
+      (if (contains? permissions (:type cmd))
+        (-> (command-handler cmd application injections)
+            (enrich-result cmd)
+            (postprocess-command-result-for-tests cmd application))
+        {:errors (or (:errors (command-handler cmd application injections)) ; prefer more specific error
+                     [{:type :forbidden}])})
+      (catch ExceptionInfo e
+        (if-let [errors (:errors (ex-data e))]
+          {:errors errors}
+          (throw e))))))
 
 (deftest test-handle-command
   (let [application (model/application-view nil {:event/type :application.event/created
